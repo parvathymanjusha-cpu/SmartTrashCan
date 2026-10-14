@@ -1,0 +1,224 @@
+#include <SoftwareSerial.h>
+#include <LiquidCrystal_I2C.h>
+
+// Software Serial for GSM on Pins 2 and 3 (Avoids Pins 0 & 1 conflict)
+#define SIM800_RX 2
+#define SIM800_TX 3
+SoftwareSerial sim800l(SIM800_RX, SIM800_TX);
+
+// LCD setup (Try 0x3F if 0x27 does not respond)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Ultrasonic Sensor Pins
+const int trigPin = 9;
+const int echoPin = 10;
+
+// Trashcan Threshold (in cm)
+long FULL_DISTANCE = 10;   // Distance when bin is full
+long EMPTY_DISTANCE = 50;  // Distance when bin is empty
+
+// Timing & State Management
+unsigned long lastSMSTime = 0;
+const unsigned long smsInterval = 300000; // 5 minutes between SMS alerts to prevent spamming
+bool isAlertSent = false;
+
+// Alert Phone Number (Include country code)
+String phoneNumber = "+917994105954";
+
+// --------------------------------------------------------------
+// Function Prototypes
+// --------------------------------------------------------------
+long getDistance();
+long getAverageDistance(int samples);
+void setLimits();
+void sendSMS(String msg);
+
+// --------------------------------------------------------------
+// Setup
+// --------------------------------------------------------------
+void setup() {
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Initializing...");
+
+  // Initialize GSM Module
+  sim800l.begin(9600);
+  delay(2000);
+
+  // Send initial AT test command to verify GSM connection
+  sim800l.println("AT");
+  delay(1000);
+
+  lcd.clear();
+  setLimits();
+}
+
+// --------------------------------------------------------------
+// Main Loop
+// --------------------------------------------------------------
+void loop() {
+  long distance = getAverageDistance(5);
+
+  if (distance == -1) {
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Error   ");
+    delay(500);
+    return;
+  }
+
+  // Display raw distance
+  lcd.setCursor(0, 0);
+  lcd.print("Dist: ");
+  lcd.print(distance);
+  lcd.print(" cm    ");
+
+  // Calculate percentage filled
+  double fillSpan = (double)(EMPTY_DISTANCE - FULL_DISTANCE);
+  double currentFill = (double)(EMPTY_DISTANCE - distance);
+  double percent = 0.0;
+
+  if (fillSpan > 0) {
+    percent = (currentFill / fillSpan) * 100.00;
+  }
+  
+  // Constrain percentage between 0% and 100%
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+
+  // Render status on LCD
+  lcd.setCursor(0, 1);
+  if (percent >= 100.0 || distance <= FULL_DISTANCE) {
+    lcd.print("STATUS: FULL!!  ");
+  } else {
+    lcd.print("Fill: ");
+    lcd.print((int)percent);
+    lcd.print("%       ");
+  }
+
+  // Check threshold and manage SMS notifications
+  unsigned long now = millis();
+  if (distance <= FULL_DISTANCE) {
+    if (!isAlertSent || (now - lastSMSTime > smsInterval)) {
+      String alertMsg = "ALERT: Smart Trash Can is FULL! Location: Ward 12. Fill Level: " + String((int)percent) + "%";
+      sendSMS(alertMsg);
+      lastSMSTime = now;
+      isAlertSent = true;
+    }
+  } else {
+    // Reset alert trigger once the bin is emptied
+    isAlertSent = false;
+  }
+
+  delay(500);
+}
+
+// --------------------------------------------------------------
+// Calibration Setup
+// --------------------------------------------------------------
+void setLimits() {
+  lcd.setCursor(0, 0);
+  lcd.print("Calibration Mode");
+  delay(1500);
+
+  // Set Empty Bound
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Set EMPTY Bound");
+  for (int countdown = 5; countdown > 0; countdown--) {
+    lcd.setCursor(0, 1);
+    lcd.print("Reading in ");
+    lcd.print(countdown);
+    lcd.print("s ");
+    delay(1000);
+  }
+  EMPTY_DISTANCE = getAverageDistance(10);
+  lcd.clear();
+  lcd.print("EMPTY: ");
+  lcd.print(EMPTY_DISTANCE);
+  lcd.print(" cm");
+  delay(2000);
+
+  // Set Full Bound
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Set FULL Bound");
+  for (int countdown = 5; countdown > 0; countdown--) {
+    lcd.setCursor(0, 1);
+    lcd.print("Reading in ");
+    lcd.print(countdown);
+    lcd.print("s ");
+    delay(1000);
+  }
+  FULL_DISTANCE = getAverageDistance(10);
+  lcd.clear();
+  lcd.print("FULL: ");
+  lcd.print(FULL_DISTANCE);
+  lcd.print(" cm");
+  delay(2000);
+  lcd.clear();
+}
+
+// --------------------------------------------------------------
+// Ultrasonic Measurement Functions
+// --------------------------------------------------------------
+long getDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 25000); // 25ms timeout (~4m limit)
+  if (duration == 0) return -1;
+
+  return duration / 58; // Convert to cm
+}
+
+long getAverageDistance(int samples) {
+  long total = 0;
+  int validSamples = 0;
+
+  for (int i = 0; i < samples; i++) {
+    long dist = getDistance();
+    if (dist > 0) {
+      total += dist;
+      validSamples++;
+    }
+    delay(30);
+  }
+
+  if (validSamples == 0) return -1;
+  return total / validSamples;
+}
+
+// --------------------------------------------------------------
+// SIM800L SMS Transmission
+// --------------------------------------------------------------
+void sendSMS(String msg) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sending SMS...");
+
+  sim800l.println("AT+CMGF=1"); // Set text mode
+  delay(500);
+
+  sim800l.print("AT+CMGS=\"");
+  sim800l.print(phoneNumber);
+  sim800l.println("\"");
+  delay(500);
+
+  sim800l.print(msg);
+  delay(500);
+
+  sim800l.write(26); // CTRL+Z to send
+  delay(3000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SMS Sent!");
+  delay(1000);
+}
